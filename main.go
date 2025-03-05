@@ -1,174 +1,164 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 
 	"github.com/gorilla/websocket"
 )
 
-type GameHub struct {
-	Games map[string]*GameRoom
-	Mutex sync.Mutex
+type GameEvent struct {
+	Event   string      `json:"event"`
+	GameID  string      `json:"gameId"`
+	Payload interface{} `json:"payload"`
+}
+
+type Player struct {
+	Name       string   `json:"name"`
+	Balance    int      `json:"balance"`
+	Position   int      `json:"position"`
+	Properties []string `json:"properties"`
+	JailTurns  int      `json:"jailTurns"`
+}
+
+type GameState struct {
+	Players map[string]*Player
+	Turn    string
 }
 
 type GameRoom struct {
-	GameID    string
+	ID        string
 	Players   map[*websocket.Conn]string
-	Broadcast chan []byte
-	Mutex     sync.Mutex
+	GameState GameState
+	Mutex     sync.RWMutex
 }
 
-var hub = GameHub{
-	Games: make(map[string]*GameRoom),
+type GameHub struct {
+	Rooms map[string]*GameRoom
+	Mutex sync.RWMutex
 }
 
-// Create a new game room
-func (h *GameHub) CreateGame(gameID string) *GameRoom {
-	h.Mutex.Lock()
-	defer h.Mutex.Unlock()
+var hub = GameHub{Rooms: make(map[string]*GameRoom)}
 
-	// If game already exists, return it
-	if room, exists := h.Games[gameID]; exists {
-		return room
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		fmt.Println("WebSocket upgrade failed:", err)
+		return
 	}
-
-	room := &GameRoom{
-		GameID:    gameID,
-		Players:   make(map[*websocket.Conn]string),
-		Broadcast: make(chan []byte),
-	}
-
-	h.Games[gameID] = room
-
-	go room.ListenForMessages()
-
-	return room
-}
-
-// Listen for messages and broadcast them
-func (r *GameRoom) ListenForMessages() {
-	for msg := range r.Broadcast {
-		r.Mutex.Lock()
-		for conn := range r.Players {
-			err := conn.WriteMessage(websocket.TextMessage, msg)
-			if err != nil {
-				fmt.Println("Error sending message:", err)
-				conn.Close()
-				delete(r.Players, conn)
-			}
-		}
-		r.Mutex.Unlock()
-	}
-}
-
-// Add a player to a game
-func (h *GameHub) AddPlayer(gameID string, conn *websocket.Conn, playerName string) {
-	h.Mutex.Lock()
-	defer h.Mutex.Unlock()
-
-	room, exists := h.Games[gameID]
-	if !exists {
-		fmt.Println("Game not found")
+	roomID := r.URL.Query().Get("gameId")
+	playerName := r.URL.Query().Get("name")
+	if roomID == "" || playerName == "" {
+		conn.Close()
 		return
 	}
 
-	// Add player to room
-	room.Mutex.Lock()
+	hub.Mutex.Lock()
+	room, exists := hub.Rooms[roomID]
+	if !exists {
+		room = &GameRoom{
+			ID:      roomID,
+			Players: make(map[*websocket.Conn]string),
+			GameState: GameState{
+				Players: make(map[string]*Player),
+			},
+		}
+		hub.Rooms[roomID] = room
+	}
 	room.Players[conn] = playerName
-	room.Mutex.Unlock()
+	room.GameState.Players[playerName] = &Player{Name: playerName, Balance: 1500, Position: 0}
+	hub.Mutex.Unlock()
 
-	fmt.Printf("Player %s joined game %s\n", playerName, gameID)
+	fmt.Println("Player joined:", playerName)
 
-	// Notify all players
-	message := []byte(fmt.Sprintf("%s joined the game!", playerName))
-	room.Broadcast <- message
-
-	// Start listening for player messages
-	go handlePlayerMessages(conn, room)
-}
-
-// Handle player messages
-func handlePlayerMessages(conn *websocket.Conn, room *GameRoom) {
 	defer func() {
-		room.Mutex.Lock()
+		hub.Mutex.Lock()
 		delete(room.Players, conn)
-		room.Mutex.Unlock()
+		hub.Mutex.Unlock()
 		conn.Close()
+		fmt.Println("Player disconnected:", playerName)
 	}()
 
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			fmt.Println("Player disconnected:", err)
+			fmt.Println("Read error:", err)
 			break
 		}
-		room.Broadcast <- msg // Send received message to all players
+		var event GameEvent
+		if err := json.Unmarshal(msg, &event); err != nil {
+			fmt.Println("Invalid JSON format:", err)
+			continue
+		}
+		handleGameEvent(room, event, conn)
 	}
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "Welcome to Monopoly Backend!")
+func handleGameEvent(room *GameRoom, event GameEvent, conn *websocket.Conn) {
+	room.Mutex.Lock()
+	defer room.Mutex.Unlock()
+
+	switch event.Event {
+	case "ROLL_DICE":
+		HandleRollDiceEvent(room, event)
+	case "BUY_PROPERTY":
+		HandleBuyPropertyEvent(room, event)
+	case "END_TURN":
+		HandleEndTurnEvent(room, event)
+	default:
+		fmt.Println("Unknown event:", event.Event)
+	}
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins
-	},
+func HandleRollDiceEvent(room *GameRoom, event GameEvent) {
+	payload, _ := event.Payload.(map[string]interface{})
+	playerName := payload["player"].(string)
+	roll := int(payload["diceRoll"].(float64))
+
+	room.GameState.Players[playerName].Position += roll
+	SendGameEventToAll(room, "ROLL_DICE", event.GameID, payload)
 }
 
-// WebSocket connection for starting a game
-func StartGameWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		http.Error(w, "Could not open WebSocket", http.StatusBadRequest)
-		return
-	}
+func HandleBuyPropertyEvent(room *GameRoom, event GameEvent) {
+	payload, _ := event.Payload.(map[string]interface{})
+	playerName := payload["player"].(string)
+	propertyName := payload["property"].(string)
 
-	// Get game ID from query params
-	gameID := r.URL.Query().Get("gameId")
-	playerName := r.URL.Query().Get("playerName")
-
-	if gameID == "" || playerName == "" {
-		conn.WriteMessage(websocket.TextMessage, []byte("Missing gameId or playerName"))
-		conn.Close()
-		return
-	}
-
-	hub.CreateGame(gameID) // Create or retrieve game
-	hub.AddPlayer(gameID, conn, playerName)
-
-	fmt.Println("Game started:", gameID)
+	player := room.GameState.Players[playerName]
+	player.Properties = append(player.Properties, propertyName)
+	SendGameEventToAll(room, "BUY_PROPERTY", event.GameID, payload)
 }
 
-// WebSocket connection for joining an existing game
-func JoinGameWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		http.Error(w, "Could not open WebSocket", http.StatusBadRequest)
-		return
+func HandleEndTurnEvent(room *GameRoom, event GameEvent) {
+	// Rotate turn among players
+	for name := range room.GameState.Players {
+		if name != room.GameState.Turn {
+			room.GameState.Turn = name
+			break
+		}
 	}
+	SendGameEventToAll(room, "END_TURN", event.GameID, map[string]string{"nextTurn": room.GameState.Turn})
+}
 
-	gameID := r.URL.Query().Get("gameId")
-	playerName := r.URL.Query().Get("playerName")
-
-	if gameID == "" || playerName == "" {
-		conn.WriteMessage(websocket.TextMessage, []byte("Missing gameId or playerName"))
-		conn.Close()
-		return
+func SendGameEventToAll(room *GameRoom, eventType string, gameID string, payload interface{}) {
+	message, _ := json.Marshal(GameEvent{Event: eventType, GameID: gameID, Payload: payload})
+	room.Mutex.RLock()
+	defer room.Mutex.RUnlock()
+	for conn := range room.Players {
+		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			fmt.Println("Error sending message:", err)
+		}
 	}
-
-	hub.AddPlayer(gameID, conn, playerName)
 }
 
 func main() {
-	http.HandleFunc("/", handler)
-	http.HandleFunc("/ws/start", StartGameWS)
-	http.HandleFunc("/ws/join", JoinGameWS)
-
-	port := "8080"
-	fmt.Println("Server running on port:", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	http.HandleFunc("/ws", handleWebSocket)
+	fmt.Println("WebSocket server started on ws://localhost:8080/ws")
+	http.ListenAndServe(":8080", nil)
 }
